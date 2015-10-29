@@ -25,7 +25,7 @@ import SlamData.Notebook.Port
 import SlamData.Slam
 
 import Photons.Fold ((^?), preview)
-import Photons.Prism (PrismP(), review)
+import Photons.Prism (APrismP(), PrismP(), review, clonePrism)
 
 -- | The slot address value for cells and identifier within the notebook graph.
 newtype CellId = CellId Int
@@ -68,6 +68,8 @@ type Def s f =
   , renderResults :: s -> ComponentHTML (Coproduct CellQuery f)
   , eval :: Natural f (ComponentDSL (CellState s) (Coproduct CellQuery f) Slam)
   , run :: Port -> ComponentDSL (CellState s) (Coproduct CellQuery f) Slam Port
+  , _State :: APrismP AnyCellState s
+  , _Query :: forall a. APrismP (AnyCellQuery a) (f a)
   }
 
 type CellStateP = CellState AnyCellState
@@ -76,11 +78,10 @@ type CellQueryP = Coproduct CellQuery AnyCellQuery
 mkCellComponent
   :: forall s f
    . Def s f
-  -> PrismP AnyCellState s
-  -> (forall a. PrismP (AnyCellQuery a) (f a))
   -> Component CellStateP CellQueryP Slam
-mkCellComponent def _State _Query = component render (coproduct eval evalInner)
+mkCellComponent def = component render (coproduct eval evalInner)
   where
+
   render :: CellStateP -> ComponentHTML CellQueryP
   render cs = case cs.innerState ^? _State of
     Nothing -> H.div_ []
@@ -102,15 +103,6 @@ mkCellComponent def _State _Query = component render (coproduct eval evalInner)
             [ translateF <$> def.renderResults innerState ]
         ]
 
-  translateF :: Natural (Coproduct CellQuery f) CellQueryP
-  translateF = coproduct left (right <<< review _Query)
-
-  fromState' :: CellState AnyCellState -> Maybe (CellState s)
-  fromState' cs = map (\is -> mapCS (const is) cs) $ cs.innerState ^? _State
-
-  mapCS :: forall a b. (a -> b) -> CellState a -> CellState b
-  mapCS f cs = cs { innerState = f cs.innerState }
-
   eval :: Natural CellQuery (ComponentDSL CellStateP CellQueryP Slam)
   eval (RunCell next) = pure next
   eval (UpdateCell input next) = do
@@ -128,6 +120,30 @@ mkCellComponent def _State _Query = component render (coproduct eval evalInner)
     modify (_ { editorVisible = b }) $> next
   eval (ShareCell next) = pure next
 
+  evalInner :: Natural AnyCellQuery (ComponentDSL CellStateP CellQueryP Slam)
+  evalInner q = case q ^? _Query of
+    Just q' -> do
+      cs <- get
+      case fromState' cs of
+        Nothing -> halt
+        Just cs' -> mapF (eta cs') $ def.eval q'
+    Nothing -> halt
+
+  _State :: PrismP AnyCellState s
+  _State = clonePrism def._State
+
+  _Query :: forall a. PrismP (AnyCellQuery a) (f a)
+  _Query = clonePrism def._Query
+
+  translateF :: Natural (Coproduct CellQuery f) CellQueryP
+  translateF = coproduct left (right <<< review _Query)
+
+  fromState' :: CellState AnyCellState -> Maybe (CellState s)
+  fromState' cs = map (\is -> mapCS (const is) cs) $ cs.innerState ^? _State
+
+  mapCS :: forall a b. (a -> b) -> CellState a -> CellState b
+  mapCS f cs = cs { innerState = f cs.innerState }
+
   extractState :: CellState s -> CellStateP -> CellState s
   extractState orig cs = case cs.innerState ^? _State of
     Nothing -> orig
@@ -140,15 +156,6 @@ mkCellComponent def _State _Query = component render (coproduct eval evalInner)
 
   eta :: CellState s -> Natural (HalogenF (CellState s) (Coproduct CellQuery f) Slam) (HalogenF CellStateP CellQueryP Slam)
   eta st = transformHF (mapState (extractState st) modifyState) translateF id
-
-  evalInner :: Natural AnyCellQuery (ComponentDSL CellStateP CellQueryP Slam)
-  evalInner q = case q ^? _Query of
-    Just q' -> do
-      cs <- get
-      case fromState' cs of
-        Nothing -> halt
-        Just cs' -> mapF (eta cs') $ def.eval q'
-    Nothing -> halt
 
 halt :: forall s f g a. Free (HalogenF s f g) a
 halt = liftF HaltHF
